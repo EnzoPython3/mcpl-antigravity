@@ -1,0 +1,222 @@
+name: Dependency Compatibility Check
+
+# This workflow verifies that when users install n8n-mcp via npm (without lockfile),
+# they get compatible dependency versions. This catches issues like #440, #444, #446, #447, #450
+# where npm resolution gave users incompatible SDK/Zod versions.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/dependency-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/dependency-check.yml'
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+  # Run weekly to catch upstream dependency changes
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6 AM UTC
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-install-check:
+    name: Fresh Install Dependency Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build package
+        run: |
+          npm ci
+          npm run build
+
+      - name: Pack package for testing
+        run: npm pack
+
+      - name: Create fresh install test directory
+        run: |
+          mkdir -p /tmp/fresh-install-test
+          cp n8n-mcp-*.tgz /tmp/fresh-install-test/
+
+      - name: Install package fresh (simulating user install)
+        working-directory: /tmp/fresh-install-test
+        run: |
+          npm init -y
+          # Install from tarball WITHOUT lockfile (simulates npm install n8n-mcp)
+          npm install ./n8n-mcp-*.tgz
+
+      - name: Verify critical dependency versions
+        working-directory: /tmp/fresh-install-test
+        run: |
+          echo "=== Dependency Version Check ==="
+          echo ""
+
+          # Get actual resolved versions
+          SDK_VERSION=$(npm list @modelcontextprotocol/sdk --json 2>/dev/null | jq -r '.dependencies["n8n-mcp"].dependencies["@modelcontextprotocol/sdk"].version // .dependencies["@modelcontextprotocol/sdk"].version // "not found"')
+          ZOD_VERSION=$(npm list zod --json 2>/dev/null | jq -r '.dependencies["n8n-mcp"].dependencies.zod.version // .dependencies.zod.version // "not found"')
+
+          echo "MCP SDK version: $SDK_VERSION"
+          echo "Zod version: $ZOD_VERSION"
+          echo ""
+
+          # Check MCP SDK version - must be exactly 1.20.1
+          if [[ "$SDK_VERSION" == "not found" ]]; then
+            echo "❌ FAILED: Could not determine MCP SDK version!"
+            echo "   The dependency may not have been installed correctly."
+            exit 1
+          fi
+          if [[ "$SDK_VERSION" != "1.20.1" ]]; then
+            echo "❌ FAILED: MCP SDK version mismatch!"
+            echo "   Expected: 1.20.1"
+            echo "   Got: $SDK_VERSION"
+            echo ""
+            echo "This can cause runtime errors. See issues #440, #444, #446, #447, #450"
+            exit 1
+          fi
+          echo "✅ MCP SDK version is correct: $SDK_VERSION"
+
+          # Check Zod version - must be 3.x (not 4.x, including pre-releases)
+          if [[ "$ZOD_VERSION" == "not found" ]]; then
+            echo "❌ FAILED: Could not determine Zod version!"
+            echo "   The dependency may not have been installed correctly."
+            exit 1
+          fi
+          if [[ "$ZOD_VERSION" =~ ^4\. ]]; then
+            echo "❌ FAILED: Zod v4 detected - incompatible with MCP SDK 1.20.1!"
+            echo "   Expected: 3.x"
+            echo "   Got: $ZOD_VERSION"
+            echo ""
+            echo "Zod v4 causes '_zod' property errors. See issues #440, #444, #446, #447, #450"
+            exit 1
+          fi
+          echo "✅ Zod version is compatible: $ZOD_VERSION"
+
+          echo ""
+          echo "=== All dependency checks passed ==="
+
+      - name: Test basic functionality
+        working-directory: /tmp/fresh-install-test
+        run: |
+          echo "=== Basic Functionality Test ==="
+
+          # Create a simple test script
+          cat > test-import.mjs << 'EOF'
+          import { spawn } from 'child_process';
+          import path from 'path';
+          import { fileURLToPath } from 'url';
+
+          const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+          // Test that the package can be required and basic tools work
+          async function test() {
+            console.log('Testing n8n-mcp package import...');
+
+            // Start the MCP server briefly to verify it initializes
+            const serverPath = path.join(__dirname, 'node_modules/n8n-mcp/dist/mcp/index.js');
+
+            const proc = spawn('node', [serverPath], {
+              env: { ...process.env, MCP_MODE: 'stdio' },
+              stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            // Send initialize request
+            const initRequest = JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'initialize',
+              params: {
+                protocolVersion: '2024-11-05',
+                capabilities: {},
+                clientInfo: { name: 'test', version: '1.0.0' }
+              }
+            });
+
+            proc.stdin.write(initRequest + '\n');
+
+            // Wait for response or timeout
+            let output = '';
+            let stderrOutput = '';
+            proc.stdout.on('data', (data) => {
+              output += data.toString();
+            });
+
+            proc.stderr.on('data', (data) => {
+              stderrOutput += data.toString();
+              console.error('stderr:', data.toString());
+            });
+
+            // Give it 5 seconds to respond
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+
+            proc.kill();
+
+            // Check for Zod v4 compatibility errors (the bug we're testing for)
+            const allOutput = output + stderrOutput;
+            if (allOutput.includes('_zod') || allOutput.includes('Cannot read properties of undefined')) {
+              console.error('❌ FAILED: Zod compatibility error detected!');
+              console.error('This indicates the SDK/Zod version fix is not working.');
+              console.error('See issues #440, #444, #446, #447, #450');
+              process.exit(1);
+            }
+
+            if (output.includes('"result"')) {
+              console.log('✅ MCP server initialized successfully');
+              return true;
+            } else {
+              console.log('Output received:', output.substring(0, 500));
+              // Server might not respond in stdio mode without proper framing
+              // But if we got here without crashing, that's still good
+              console.log('✅ MCP server started without errors');
+              return true;
+            }
+          }
+
+          test()
+            .then(() => {
+              console.log('=== Basic functionality test passed ===');
+              process.exit(0);
+            })
+            .catch((err) => {
+              console.error('❌ Test failed:', err.message);
+              process.exit(1);
+            });
+          EOF
+
+          node test-import.mjs
+
+      - name: Generate dependency report
+        if: always()
+        working-directory: /tmp/fresh-install-test
+        run: |
+          echo "=== Full Dependency Tree ===" > dependency-report.txt
+          npm list --all >> dependency-report.txt 2>&1 || true
+
+          echo "" >> dependency-report.txt
+          echo "=== Critical Dependencies ===" >> dependency-report.txt
+          npm list @modelcontextprotocol/sdk zod zod-to-json-schema >> dependency-report.txt 2>&1 || true
+
+          cat dependency-report.txt
+
+      - name: Upload dependency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-report-${{ github.run_number }}
+          path: /tmp/fresh-install-test/dependency-report.txt
+          retention-days: 30

@@ -1,0 +1,673 @@
+name: Automated Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'package.json'
+      - 'package.runtime.json'
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+  pull-requests: write
+
+# Prevent concurrent Docker pushes across all workflows (shared with docker-build.yml)
+# This ensures release.yml and docker-build.yml never push to 'latest' simultaneously
+concurrency:
+  group: docker-push-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  detect-version-change:
+    name: Detect Version Change
+    runs-on: ubuntu-latest
+    outputs:
+      version-changed: ${{ steps.check.outputs.changed }}
+      new-version: ${{ steps.check.outputs.version }}
+      previous-version: ${{ steps.check.outputs.previous-version }}
+      is-prerelease: ${{ steps.check.outputs.is-prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      
+      - name: Check for version change
+        id: check
+        run: |
+          # Get current version from package.json
+          CURRENT_VERSION=$(node -e "console.log(require('./package.json').version)")
+          
+          # Get previous version from git history safely
+          PREVIOUS_VERSION=$(git show HEAD~1:package.json 2>/dev/null | node -e "
+            try {
+              const data = require('fs').readFileSync(0, 'utf8');
+              const pkg = JSON.parse(data);
+              console.log(pkg.version || '0.0.0');
+            } catch (e) {
+              console.log('0.0.0');
+            }
+          " || echo "0.0.0")
+          
+          echo "Previous version: $PREVIOUS_VERSION"
+          echo "Current version: $CURRENT_VERSION"
+          
+          # Check if version changed
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+            echo "previous-version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+            
+            # Check if it's a prerelease (contains alpha, beta, rc, dev)
+            if echo "$CURRENT_VERSION" | grep -E "(alpha|beta|rc|dev)" > /dev/null; then
+              echo "is-prerelease=true" >> $GITHUB_OUTPUT
+            else
+              echo "is-prerelease=false" >> $GITHUB_OUTPUT
+            fi
+            
+            echo "🎉 Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+            echo "previous-version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+            echo "is-prerelease=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No version change detected"
+          fi
+
+      - name: Validate version against npm registry
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          CURRENT_VERSION="${{ steps.check.outputs.version }}"
+
+          # Get latest version from npm (handle package not found)
+          NPM_VERSION=$(npm view n8n-mcp version 2>/dev/null || echo "0.0.0")
+
+          echo "Current version: $CURRENT_VERSION"
+          echo "NPM registry version: $NPM_VERSION"
+
+          # Check if version already exists in npm
+          if [ "$CURRENT_VERSION" = "$NPM_VERSION" ]; then
+            echo "❌ Error: Version $CURRENT_VERSION already published to npm"
+            echo "Please bump the version in package.json before releasing"
+            exit 1
+          fi
+
+          # Simple semver comparison (assumes format: major.minor.patch)
+          # Compare if current version is greater than npm version
+          if [ "$NPM_VERSION" != "0.0.0" ]; then
+            # Sort versions and check if current is not the highest
+            HIGHEST=$(printf '%s\n%s' "$NPM_VERSION" "$CURRENT_VERSION" | sort -V | tail -n1)
+            if [ "$HIGHEST" != "$CURRENT_VERSION" ]; then
+              echo "❌ Error: Version $CURRENT_VERSION is not greater than npm version $NPM_VERSION"
+              echo "Please use a higher version number"
+              exit 1
+            fi
+          fi
+
+          echo "✅ Version $CURRENT_VERSION is valid (higher than npm version $NPM_VERSION)"
+
+  generate-release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    needs: detect-version-change
+    if: needs.detect-version-change.outputs.version-changed == 'true'
+    outputs:
+      release-notes: ${{ steps.generate.outputs.notes }}
+      has-notes: ${{ steps.generate.outputs.has-notes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for git log
+
+      - name: Generate release notes from commits
+        id: generate
+        run: |
+          CURRENT_VERSION="${{ needs.detect-version-change.outputs.new-version }}"
+          CURRENT_TAG="v$CURRENT_VERSION"
+
+          # Get the previous tag (excluding the current tag which doesn't exist yet)
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -v "^$CURRENT_TAG$" | head -1)
+
+          echo "Current version: $CURRENT_VERSION"
+          echo "Current tag: $CURRENT_TAG"
+          echo "Previous tag: $PREVIOUS_TAG"
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "ℹ️ No previous tag found, this might be the first release"
+
+            # Generate initial release notes using script
+            if NOTES=$(node scripts/generate-initial-release-notes.js "$CURRENT_VERSION" 2>/dev/null); then
+              echo "✅ Successfully generated initial release notes for version $CURRENT_VERSION"
+            else
+              echo "⚠️ Could not generate initial release notes for version $CURRENT_VERSION"
+              NOTES="Initial release v$CURRENT_VERSION"
+            fi
+
+            echo "has-notes=true" >> $GITHUB_OUTPUT
+
+            # Use heredoc to properly handle multiline content
+            {
+              echo "notes<<EOF"
+              echo "$NOTES"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+
+          else
+            echo "✅ Previous tag found: $PREVIOUS_TAG"
+
+            # Generate release notes between tags
+            if NOTES=$(node scripts/generate-release-notes.js "$PREVIOUS_TAG" "HEAD" 2>/dev/null); then
+              echo "has-notes=true" >> $GITHUB_OUTPUT
+
+              # Use heredoc to properly handle multiline content
+              {
+                echo "notes<<EOF"
+                echo "$NOTES"
+                echo "EOF"
+              } >> $GITHUB_OUTPUT
+
+              echo "✅ Successfully generated release notes from $PREVIOUS_TAG to $CURRENT_TAG"
+            else
+              echo "has-notes=false" >> $GITHUB_OUTPUT
+              echo "notes=Failed to generate release notes for version $CURRENT_VERSION" >> $GITHUB_OUTPUT
+              echo "⚠️ Could not generate release notes for version $CURRENT_VERSION"
+            fi
+          fi
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, generate-release-notes]
+    if: needs.detect-version-change.outputs.version-changed == 'true'
+    outputs:
+      release-id: ${{ steps.create.outputs.id }}
+      upload-url: ${{ steps.create.outputs.upload_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Create Git Tag
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.new-version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create annotated tag
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+      
+      - name: Create GitHub Release
+        id: create
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.new-version }}"
+          IS_PRERELEASE="${{ needs.detect-version-change.outputs.is-prerelease }}"
+          
+          # Create release body
+          cat > release_body.md << 'EOF'
+          # Release v${{ needs.detect-version-change.outputs.new-version }}
+          
+          ${{ needs.generate-release-notes.outputs.release-notes }}
+          
+          ---
+          
+          ## Installation
+          
+          ### NPM Package
+          ```bash
+          # Install globally
+          npm install -g n8n-mcp
+          
+          # Or run directly
+          npx n8n-mcp
+          ```
+          
+          ### Docker
+          ```bash
+          # Standard image
+          docker run -p 3000:3000 ghcr.io/czlonkowski/n8n-mcp:v${{ needs.detect-version-change.outputs.new-version }}
+          
+          # Railway optimized
+          docker run -p 3000:3000 ghcr.io/czlonkowski/n8n-mcp-railway:v${{ needs.detect-version-change.outputs.new-version }}
+          ```
+          
+          ## Documentation
+          - [Installation Guide](https://github.com/czlonkowski/n8n-mcp#installation)
+          - [Docker Deployment](https://github.com/czlonkowski/n8n-mcp/blob/main/docs/DOCKER_README.md)
+          - [n8n Integration](https://github.com/czlonkowski/n8n-mcp/blob/main/docs/N8N_DEPLOYMENT.md)
+          - [Complete Changelog](https://github.com/czlonkowski/n8n-mcp/blob/main/docs/CHANGELOG.md)
+          
+          🤖 *Generated with [Claude Code](https://claude.ai/code)*
+          EOF
+          
+          # Create release using gh CLI
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          else
+            PRERELEASE_FLAG=""
+          fi
+          
+          gh release create "v$VERSION" \
+            --title "Release v$VERSION" \
+            --notes-file release_body.md \
+            $PRERELEASE_FLAG
+          
+          # Output release info for next jobs
+          RELEASE_ID=$(gh release view "v$VERSION" --json id --jq '.id')
+          echo "id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "upload_url=https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets{?name,label}" >> $GITHUB_OUTPUT
+
+  build-and-verify:
+    name: Build and Verify
+    runs-on: ubuntu-latest
+    needs: detect-version-change
+    if: needs.detect-version-change.outputs.version-changed == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build project
+        run: npm run build
+
+      # Database is already built and committed during development
+      # Rebuilding here causes segfault due to memory pressure (exit code 139)
+      - name: Verify database exists
+        run: |
+          if [ ! -f "data/nodes.db" ]; then
+            echo "❌ Error: data/nodes.db not found"
+            echo "Please run 'npm run rebuild' locally and commit the database"
+            exit 1
+          fi
+          echo "✅ Database exists ($(du -h data/nodes.db | cut -f1))"
+
+      # Skip tests - they already passed in PR before merge
+      # Running them again on the same commit adds no safety, only time (~6-7 min)
+
+      - name: Run type checking
+        run: npm run typecheck
+
+  publish-npm:
+    name: Publish to NPM
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, build-and-verify, create-release]
+    if: needs.detect-version-change.outputs.version-changed == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build project
+        run: npm run build
+
+      # Database is already built and committed during development
+      - name: Verify database exists
+        run: |
+          if [ ! -f "data/nodes.db" ]; then
+            echo "❌ Error: data/nodes.db not found"
+            exit 1
+          fi
+          echo "✅ Database exists ($(du -h data/nodes.db | cut -f1))"
+
+      - name: Sync runtime version
+        run: npm run sync:runtime-version
+      
+      - name: Prepare package for publishing
+        run: |
+          # Create publish directory
+          PUBLISH_DIR="npm-publish-temp"
+          rm -rf $PUBLISH_DIR
+          mkdir -p $PUBLISH_DIR
+          
+          # Copy necessary files
+          cp -r dist $PUBLISH_DIR/
+          cp -r data $PUBLISH_DIR/
+          cp README.md $PUBLISH_DIR/
+          cp LICENSE $PUBLISH_DIR/
+          cp .env.example $PUBLISH_DIR/
+          
+          # Use runtime package.json as base
+          cp package.runtime.json $PUBLISH_DIR/package.json
+          
+          cd $PUBLISH_DIR
+          
+          # Update package.json with complete metadata
+          node -e "
+          const pkg = require('./package.json');
+          pkg.name = 'n8n-mcp';
+          pkg.description = 'Integration between n8n workflow automation and Model Context Protocol (MCP)';
+          pkg.main = 'dist/index.js';
+          pkg.types = 'dist/index.d.ts';
+          pkg.exports = {
+            '.': {
+              types: './dist/index.d.ts',
+              require: './dist/index.js',
+              import: './dist/index.js'
+            }
+          };
+          pkg.bin = { 'n8n-mcp': './dist/mcp/index.js' };
+          pkg.repository = { type: 'git', url: 'git+https://github.com/czlonkowski/n8n-mcp.git' };
+          pkg.keywords = ['n8n', 'mcp', 'model-context-protocol', 'ai', 'workflow', 'automation'];
+          pkg.author = 'Romuald Czlonkowski @ www.aiadvisors.pl/en';
+          pkg.license = 'MIT';
+          pkg.bugs = { url: 'https://github.com/czlonkowski/n8n-mcp/issues' };
+          pkg.homepage = 'https://github.com/czlonkowski/n8n-mcp#readme';
+          pkg.files = ['dist/**/*', 'data/nodes.db', '.env.example', 'README.md', 'LICENSE'];
+          delete pkg.private;
+          require('fs').writeFileSync('./package.json', JSON.stringify(pkg, null, 2));
+          "
+          
+          echo "Package prepared for publishing:"
+          echo "Name: $(node -e "console.log(require('./package.json').name)")"
+          echo "Version: $(node -e "console.log(require('./package.json').version)")"
+      
+      - name: Publish to NPM with retry
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            cd npm-publish-temp
+            npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Clean up
+        if: always()
+        run: rm -rf npm-publish-temp
+
+  build-docker:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, build-and-verify]
+    if: needs.detect-version-change.outputs.version-changed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+      
+      - name: Check disk space
+        run: |
+          echo "Disk usage before Docker build:"
+          df -h
+          
+          # Check available space (require at least 2GB)
+          AVAILABLE_GB=$(df / --output=avail --block-size=1G | tail -1)
+          if [ "$AVAILABLE_GB" -lt 2 ]; then
+            echo "❌ Insufficient disk space: ${AVAILABLE_GB}GB available, 2GB required"
+            exit 1
+          fi
+          echo "✅ Sufficient disk space: ${AVAILABLE_GB}GB available"
+
+      - name: Sync runtime version for Docker
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.runtime.json'));
+            pkg.version = '$VERSION';
+            fs.writeFileSync('package.runtime.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "✅ Synced package.runtime.json to version $VERSION"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata for standard image
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.detect-version-change.outputs.new-version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.detect-version-change.outputs.new-version }}
+            type=semver,pattern={{major}},value=v${{ needs.detect-version-change.outputs.new-version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push standard Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify multi-arch manifest for latest tag
+        run: |
+          echo "Verifying multi-arch manifest for latest tag..."
+
+          # Retry with exponential backoff (registry propagation can take time)
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+          WAIT_TIME=2
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+
+            MANIFEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 || true)
+
+            # Check for both platforms
+            if echo "$MANIFEST" | grep -q "linux/amd64" && echo "$MANIFEST" | grep -q "linux/arm64"; then
+              echo "✅ Multi-arch manifest verified: both amd64 and arm64 present"
+              echo "$MANIFEST"
+              exit 0
+            fi
+
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "⏳ Registry still propagating, waiting ${WAIT_TIME}s before retry..."
+              sleep $WAIT_TIME
+              WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff: 2s, 4s, 8s, 16s
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "❌ ERROR: Multi-arch manifest incomplete after $MAX_ATTEMPTS attempts!"
+          echo "$MANIFEST"
+          exit 1
+
+      - name: Verify multi-arch manifest for version tag
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.new-version }}"
+          echo "Verifying multi-arch manifest for version tag :$VERSION (without 'v' prefix)..."
+
+          # Retry with exponential backoff (registry propagation can take time)
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+          WAIT_TIME=2
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+
+            MANIFEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION 2>&1 || true)
+
+            # Check for both platforms
+            if echo "$MANIFEST" | grep -q "linux/amd64" && echo "$MANIFEST" | grep -q "linux/arm64"; then
+              echo "✅ Multi-arch manifest verified for $VERSION: both amd64 and arm64 present"
+              echo "$MANIFEST"
+              exit 0
+            fi
+
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "⏳ Registry still propagating, waiting ${WAIT_TIME}s before retry..."
+              sleep $WAIT_TIME
+              WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff: 2s, 4s, 8s, 16s
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "❌ ERROR: Multi-arch manifest incomplete for version $VERSION after $MAX_ATTEMPTS attempts!"
+          echo "$MANIFEST"
+          exit 1
+
+      - name: Extract metadata for Railway image
+        id: meta-railway
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-railway
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.detect-version-change.outputs.new-version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.detect-version-change.outputs.new-version }}
+            type=semver,pattern={{major}},value=v${{ needs.detect-version-change.outputs.new-version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Railway Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.railway
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-railway.outputs.tags }}
+          labels: ${{ steps.meta-railway.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  update-documentation:
+    name: Update Documentation
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, create-release, publish-npm, build-docker]
+    if: needs.detect-version-change.outputs.version-changed == 'true' && !failure()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      
+      - name: Update version badges in README
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.new-version }}"
+          
+          # Update README version badges
+          if [ -f "README.md" ]; then
+            # Update npm version badge
+            sed -i.bak "s|npm/v/n8n-mcp/[^)]*|npm/v/n8n-mcp/$VERSION|g" README.md
+            
+            # Update any other version references
+            sed -i.bak "s|version-[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|version-$VERSION|g" README.md
+            
+            # Clean up backup file
+            rm -f README.md.bak
+            
+            echo "✅ Updated version badges in README.md to $VERSION"
+          fi
+      
+      - name: Commit documentation updates
+        env:
+          VERSION: ${{ needs.detect-version-change.outputs.new-version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if git diff --quiet; then
+            echo "No documentation changes to commit"
+          else
+            git add README.md
+            git commit -m "docs: update version badges to v${VERSION}"
+            git push
+            echo "✅ Committed documentation updates"
+          fi
+
+  notify-completion:
+    name: Notify Release Completion
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, create-release, publish-npm, build-docker, update-documentation]
+    if: always() && needs.detect-version-change.outputs.version-changed == 'true'
+    steps:
+      - name: Create release summary
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.new-version }}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/v$VERSION"
+          
+          echo "## 🎉 Release v$VERSION Published Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Completed Tasks:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check job statuses
+          if [ "${{ needs.create-release.result }}" = "success" ]; then
+            echo "- ✅ GitHub Release created: [$RELEASE_URL]($RELEASE_URL)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ GitHub Release creation failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.publish-npm.result }}" = "success" ]; then
+            echo "- ✅ NPM package published: [npmjs.com/package/n8n-mcp](https://www.npmjs.com/package/n8n-mcp)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ NPM publishing failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.build-docker.result }}" = "success" ]; then
+            echo "- ✅ Docker images built and pushed" >> $GITHUB_STEP_SUMMARY
+            echo "  - Standard: \`ghcr.io/czlonkowski/n8n-mcp:v$VERSION\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - Railway: \`ghcr.io/czlonkowski/n8n-mcp-railway:v$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ Docker image building failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.update-documentation.result }}" = "success" ]; then
+            echo "- ✅ Documentation updated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ⚠️ Documentation update skipped or failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Installation:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# NPM" >> $GITHUB_STEP_SUMMARY
+          echo "npx n8n-mcp" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Docker" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -p 3000:3000 ghcr.io/czlonkowski/n8n-mcp:v$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          
+          echo "🎉 Release automation completed for v$VERSION!"

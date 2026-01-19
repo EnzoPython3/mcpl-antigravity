@@ -1,0 +1,142 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+
+# Build output
+dist/
+build/
+out/
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Testing
+coverage/
+.nyc_output/
+test-results/
+test-reports/
+test-summary.md
+test-metadata.json
+benchmark-results.json
+benchmark-results*.json
+benchmark-summary.json
+coverage-report.json
+benchmark-comparison.md
+benchmark-comparison.json
+benchmark-current.json
+benchmark-baseline.json
+tests/data/*.db
+tests/fixtures/*.tmp
+tests/test-results/
+.test-dbs/
+junit.xml
+*.test.db
+test-*.db
+.vitest/
+
+# TypeScript
+*.tsbuildinfo
+.tsc-cache/
+
+# Package manager files
+.npm/
+.yarn/
+.pnp.*
+.yarn-integrity
+
+# Docker
+docker-compose.override.yml
+
+# Miscellaneous
+.eslintcache
+.stylelintcache
+*.pid
+*.seed
+*.pid.lock
+.grunt/
+.lock-wscript
+.node_repl_history
+.npmrc
+.yarnrc
+
+# Temporary files
+temp/
+tmp/
+
+# Batch processing error files (may contain API tokens from templates)
+docs/batch_*.jsonl
+**/batch_*_error.jsonl
+
+# Local documentation and analysis files
+docs/local/
+
+# Database files
+# Database files - nodes.db is now tracked directly
+# data/*.db
+data/*.db-journal
+data/*.db.bak
+data/*.db.backup
+!data/.gitkeep
+!data/nodes.db
+
+# Claude Desktop configs (personal)
+claude_desktop_config.json
+claude_desktop_config_*.json
+!claude_desktop_config.example.json
+
+# Personal wrapper scripts
+mcp-server-v20.sh
+rebuild-v20.sh
+!mcp-server-v20.example.sh
+
+# n8n-docs repo (cloned locally)
+../n8n-docs/
+n8n-docs/
+
+# npm publish temporary directory
+npm-publish-temp/
+
+# Test files and logs
+test-npx/
+mcp-server-*.log
+server.log
+server-fixed.log
+mcp-debug.log
+
+# Temporary wrapper scripts
+n8n-mcp-wrapper.sh
+
+# Package tarballs
+*.tgz
+
+# MCP configuration files
+.mcp.json
+
+# Telemetry configuration (user-specific)
+~/.n8n-mcp/

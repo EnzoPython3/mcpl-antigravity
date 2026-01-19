@@ -1,0 +1,353 @@
+name: Test Suite
+on:
+  push:
+    branches: [main, feat/comprehensive-testing-suite]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'docs/**'
+      - 'examples/**'
+      - '.github/FUNDING.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.gitignore'
+      - 'LICENSE*'
+      - 'ATTRIBUTION.md'
+      - 'SECURITY.md'
+      - 'CODE_OF_CONDUCT.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'docs/**'
+      - 'examples/**'
+      - '.github/FUNDING.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.gitignore'
+      - 'LICENSE*'
+      - 'ATTRIBUTION.md'
+      - 'SECURITY.md'
+      - 'CODE_OF_CONDUCT.md'
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # Increased from 10 to accommodate larger database with community nodes
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      # Verify test environment setup
+      - name: Verify test environment
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Checking for .env.test file:"
+          ls -la .env.test || echo ".env.test not found!"
+          echo "First few lines of .env.test:"
+          head -5 .env.test || echo "Cannot read .env.test"
+      
+      # Run unit tests first (without MSW)
+      - name: Run unit tests with coverage
+        run: npm run test:unit -- --coverage --coverage.thresholds.lines=0 --coverage.thresholds.functions=0 --coverage.thresholds.branches=0 --coverage.thresholds.statements=0 --reporter=default --reporter=junit
+        env:
+          CI: true
+      
+      # Run integration tests separately (with MSW setup)
+      - name: Run integration tests
+        run: npm run test:integration -- --reporter=default --reporter=junit
+        env:
+          CI: true
+          N8N_API_URL: ${{ secrets.N8N_API_URL }}
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+          N8N_TEST_WEBHOOK_GET_URL: ${{ secrets.N8N_TEST_WEBHOOK_GET_URL }}
+          N8N_TEST_WEBHOOK_POST_URL: ${{ secrets.N8N_TEST_WEBHOOK_POST_URL }}
+          N8N_TEST_WEBHOOK_PUT_URL: ${{ secrets.N8N_TEST_WEBHOOK_PUT_URL }}
+          N8N_TEST_WEBHOOK_DELETE_URL: ${{ secrets.N8N_TEST_WEBHOOK_DELETE_URL }}
+      
+      # Generate test summary
+      - name: Generate test summary
+        if: always()
+        run: node scripts/generate-test-summary.js
+      
+      # Generate detailed reports
+      - name: Generate detailed reports
+        if: always()
+        run: node scripts/generate-detailed-reports.js
+      
+      # Upload test results artifacts
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            test-results/
+            test-summary.md
+            test-reports/
+          retention-days: 30
+          if-no-files-found: warn
+      
+      # Upload coverage artifacts
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            coverage/
+          retention-days: 30
+          if-no-files-found: warn
+      
+      # Upload coverage to Codecov
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+          verbose: true
+      
+      # Run linting
+      - name: Run linting
+        run: npm run lint
+      
+      # Run type checking
+      - name: Run type checking
+        run: npm run typecheck
+      
+      # Run benchmarks
+      - name: Run benchmarks
+        id: benchmarks
+        run: npm run benchmark:ci
+        continue-on-error: true
+      
+      # Upload benchmark results
+      - name: Upload benchmark results
+        if: always() && steps.benchmarks.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            benchmark-results.json
+          retention-days: 30
+          if-no-files-found: warn
+      
+      # Create test report comment for PRs
+      - name: Create test report comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = '## Test Results\n\nTest summary generation failed.';
+            
+            try {
+              if (fs.existsSync('test-summary.md')) {
+                summary = fs.readFileSync('test-summary.md', 'utf8');
+              }
+            } catch (error) {
+              console.error('Error reading test summary:', error);
+            }
+            
+            try {
+              // Find existing comment
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              
+              const botComment = comments.find(comment => 
+                comment.user.type === 'Bot' && 
+                comment.body.includes('## Test Results')
+              );
+              
+              if (botComment) {
+                // Update existing comment
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body: summary
+                });
+              } else {
+                // Create new comment
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: summary
+                });
+              }
+            } catch (error) {
+              console.error('Failed to create/update PR comment:', error.message);
+              console.log('This is likely due to insufficient permissions for external PRs.');
+              console.log('Test results have been saved to the job summary instead.');
+            }
+      
+      # Generate job summary
+      - name: Generate job summary
+        if: always()
+        run: |
+          echo "# Test Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f test-summary.md ]; then
+            cat test-summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Test summary generation failed." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📥 Download Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [Test Results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Coverage Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Benchmark Results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+      
+      # Store test metadata
+      - name: Store test metadata
+        if: always()
+        run: |
+          cat > test-metadata.json << EOF
+          {
+            "run_id": "${{ github.run_id }}",
+            "run_number": "${{ github.run_number }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "sha": "${{ github.sha }}",
+            "ref": "${{ github.ref }}",
+            "event_name": "${{ github.event_name }}",
+            "repository": "${{ github.repository }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "node_version": "$(node --version)",
+            "npm_version": "$(npm --version)"
+          }
+          EOF
+      
+      - name: Upload test metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metadata-${{ github.run_number }}-${{ github.run_attempt }}
+          path: test-metadata.json
+          retention-days: 30
+
+  # Separate job to process and publish test results
+  publish-results:
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Download all artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      # Publish test results as checks
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        continue-on-error: true
+        with:
+          name: Test Results
+          path: 'artifacts/test-results-*/test-results/junit.xml'
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
+      
+      # Create a combined artifact with all results
+      - name: Create combined results artifact
+        if: always()
+        run: |
+          mkdir -p combined-results
+          cp -r artifacts/* combined-results/ 2>/dev/null || true
+          
+          # Create index file
+          cat > combined-results/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>n8n-mcp Test Results</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; }
+                  h1 { color: #333; }
+                  .section { margin: 20px 0; padding: 20px; border: 1px solid #ddd; border-radius: 5px; }
+                  a { color: #0066cc; text-decoration: none; }
+                  a:hover { text-decoration: underline; }
+              </style>
+          </head>
+          <body>
+              <h1>n8n-mcp Test Results</h1>
+              <div class="section">
+                  <h2>Test Reports</h2>
+                  <ul>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-reports/report.html">📊 Detailed HTML Report</a></li>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-results/html/index.html">📈 Vitest HTML Report</a></li>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-reports/report.md">📄 Markdown Report</a></li>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-summary.md">📝 PR Summary</a></li>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-results/junit.xml">🔧 JUnit XML</a></li>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-results/results.json">🔢 JSON Results</a></li>
+                      <li><a href="test-results-${{ github.run_number }}-${{ github.run_attempt }}/test-reports/report.json">📊 Full JSON Report</a></li>
+                  </ul>
+              </div>
+              <div class="section">
+                  <h2>Coverage Reports</h2>
+                  <ul>
+                      <li><a href="coverage-${{ github.run_number }}-${{ github.run_attempt }}/html/index.html">HTML Coverage Report</a></li>
+                      <li><a href="coverage-${{ github.run_number }}-${{ github.run_attempt }}/lcov.info">LCOV Report</a></li>
+                      <li><a href="coverage-${{ github.run_number }}-${{ github.run_attempt }}/coverage-summary.json">Coverage Summary JSON</a></li>
+                  </ul>
+              </div>
+              <div class="section">
+                  <h2>Benchmark Results</h2>
+                  <ul>
+                      <li><a href="benchmark-results-${{ github.run_number }}-${{ github.run_attempt }}/benchmark-results.json">Benchmark Results JSON</a></li>
+                  </ul>
+              </div>
+              <div class="section">
+                  <h2>Metadata</h2>
+                  <ul>
+                      <li><a href="test-metadata-${{ github.run_number }}-${{ github.run_attempt }}/test-metadata.json">Test Run Metadata</a></li>
+                  </ul>
+              </div>
+              <div class="section">
+                  <p><em>Generated at $(date -u +%Y-%m-%dT%H:%M:%SZ)</em></p>
+                  <p><em>Run: #${{ github.run_number }} | SHA: ${{ github.sha }}</em></p>
+              </div>
+          </body>
+          </html>
+          EOF
+      
+      - name: Upload combined results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-test-results-${{ github.run_number }}
+          path: combined-results/
+          retention-days: 90

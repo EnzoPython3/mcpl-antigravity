@@ -1,0 +1,17 @@
+# GitHub Pages configuration for benchmark results
+# This file configures the gh-pages branch to serve benchmark results
+
+# Path to the benchmark data
+benchmarks:
+  data_dir: benchmarks
+  
+# Theme configuration
+theme: 
+  name: minimal
+  
+# Navigation
+nav:
+  - title: "Performance Benchmarks"
+    url: /benchmarks/
+  - title: "Back to Repository"
+    url: https://github.com/czlonkowski/n8n-mcp
