@@ -47,5 +47,11 @@ Ensure you have a `.env` file in the root (or specific subprojects) with:
 *   `OPENROUTER_API_KEY`
 *   `N8N_API_KEY` (if controlling a live n8n instance)
 
+## 🙏 Credits
+
+This repository is:
+*   Based on [kenneth-liao/mcp-launchpad](https://github.com/kenneth-liao/mcp-launchpad.git)
+*   Inspired by the video by [Jack Roberts](https://youtu.be/cgl5tFN2zxA?si=AfmWEMfABuebuzJa)
+
 ---
 *Created by Antigravity*
