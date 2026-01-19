@@ -1,5 +1,0 @@
-#!/bin/bash
-PROJECT_ROOT="/Users/enzosnyman/Projects/mcpl-antigravity/workflow_factory_cli"
-cd "$PROJECT_ROOT"
-source .venv/bin/activate
-python main.py "$@"

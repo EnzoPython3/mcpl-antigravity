@@ -7,7 +7,6 @@ This repository serves as a unified workspace for **n8n workflow automation** an
 *   **`mcp-launchpad-debug/`**: The CLI (`mcpl`) orchestrator that connects AI models (like Claude/Gemini) to your local tools.
 *   **`n8n-mcp/`**: A Model Context Protocol server that bridges n8n with AI, exposing nodes and documentation as tools.
 *   **`n8n-skills/`**: A collection of "skills" (guides/prompts) that teach AI agents how to use `n8n-mcp` effectively.
-*   **`workflow_factory_cli/`**: A specialized dual-agent (Planner/Executor) system for generating n8n workflows from natural language.
 
 ## 🚀 Getting Started
 
@@ -30,15 +29,8 @@ cd mcp-launchpad-debug
 uv run mcpl search "n8n"
 ```
 
-#### Using Workflow Factory
-Generate workflows automatically.
-
-```bash
-cd workflow_factory_cli
-# Activate venv and run
-source .venv/bin/activate
-python main.py "Create a workflow that..."
-```
+#### n8n Skills
+To enable the AI skills for n8n, you can install the `n8n-skills` manually or via plugin commands found in `n8n-skills/README.md`.
 
 ## 🛠 Maintenance
 
